@@ -1,6 +1,8 @@
 # %% Import Libraries
 import pandas as pd
 import os
+import numpy as np
+from collections import defaultdict
 
 # %% User Input Area
 currency_pairs = [
@@ -30,18 +32,25 @@ df = pd.concat(dfs, ignore_index=True)
 
 # %% Add column for just date
 df['dateprocessed'] = pd.to_datetime(df['dateprocessed'], errors='coerce')
-df["processed_date"] = df["dateprocessed"].dt.date
+df['processed_date'] = df['dateprocessed'].dt.date
 cols = list(df.columns)
 cols.insert(2, cols.pop(cols.index('processed_date')))
 df = df[cols]  
 
 # Filter for successful transactions only
+# And ignores non cross-border transactions
 df = df[df['status'] == 'Success']
+df = df[df["s_fx"] != df["r_fx"]]
 
-# %% Keeping only relevant transaction
-keep_pairs = {frozenset(p) for p in currency_pairs}
-pairs = df[["s_fx", "r_fx"]].apply(frozenset, axis=1)
-df = df[pairs.isin(keep_pairs)]
+# %% Keeping only relevant transactions
+bases = {pair[0] for pair in currency_pairs}
+quotes = {pair[1] for pair in currency_pairs}
+all_pair_currencies = bases | quotes
+
+df = df[
+    df["s_fx"].isin(quotes) |
+    df["r_fx"].isin(quotes)
+]
 
 # %% Keeping only relevant columns
 keep_column = [
@@ -61,140 +70,122 @@ keep_column = [
 ]
 df = df[keep_column]
 
-# %% Weighted Average for standard pairs
-directional_list = [tuple(p) for p in currency_pairs]
-standard_df = df[df[["s_fx", "r_fx"]].apply(tuple, axis=1).isin(directional_list)]
-standard_df['tx_weighted_fx'] = standard_df['s_amount_s_fx'] * standard_df['client_fx_rate']
 
-#Daily transaction volumes for each standard pair
-daily_trans = (
-    standard_df
-    .groupby(["processed_date", "s_fx", "r_fx"], as_index=False)
-    .agg({"s_amount_s_fx": "sum"})
+# %%
+# Map base currencies to all their quotes
+base_to_quote = defaultdict(set)
+
+for base, quote in currency_pairs:
+    base_to_quote[base].add(quote)
+
+#%% Calculate the relevant FX rate for each transaction
+def classify_row(row):
+    s, r = row["s_fx"], row["r_fx"]
+    # ignore same-currency
+    if s == r:
+        return None, None 
+
+    # Case 1: s_fx is base, r_fx is quote
+    if s in base_to_quote and r in base_to_quote[s]:
+        rate = row["client_fx_rate"]
+        pair = f"{s}{r}"
+        
+    # Case 2: s_fx is quote, r_fx is base
+    elif r in base_to_quote and s in base_to_quote[r]:
+        rate = 1 / row["client_fx_rate"]
+        pair = f"{r}{s}"
+        
+    # Case 3: s_fx is non-pair, r_fx is quote
+    elif r in quotes:
+        rate = row["client_fx_rate"] * row["s_fx_to_usd"]
+        pair = f"USD{r}"
+        
+    # Case 4: s_fx is quote, r_fx is non-pair
+    elif s in quotes:
+        rate = (1 / row["client_fx_rate"]) * row["r_fx_to_usd"]
+        pair = f"USD{s}"
+    
+    # ignore anything that doesn't fit
+    else:
+        return None, None 
+
+    return rate, pair
+
+df[["standardised_rate", "standard_pair"]] = df.apply(
+    lambda row: pd.Series(classify_row(row)),
+    axis=1
 )
 
-#Total transaction volumes for each standard pair
-total_trans = (
-    standard_df
-    .groupby(["s_fx", "r_fx"], as_index=False)
-    .agg({"s_amount_s_fx": "sum"})
+# Drop rows that were ignored (None returned)
+df = df.dropna(subset=["standardised_rate"]).copy()
+
+# %% Calculating transaction weighted FX rate for each transaction
+pair_cols = df["standard_pair"].dropna().unique().tolist()
+pair_data = pd.DataFrame(np.nan, index=df.index, columns=pair_cols)
+
+for col in pair_cols:
+    mask = df["standard_pair"] == col
+    pair_data.loc[mask, col] = df.loc[mask, "standardised_rate"] * df.loc[mask, "s_amount_usd"]
+
+df = pd.concat([df, pair_data], axis=1)
+
+# %% Aggregating Transaction weighted FX rates
+# Daily transaction weighted FX
+daily_trx_fx = (
+    df
+    .groupby("processed_date")[pair_cols]
+    .sum(min_count=1)
+    .reset_index()
 )
 
-# %% Weighted Average for inverse pairs
-inverse_df = df[~df[["s_fx", "r_fx"]].apply(tuple, axis=1).isin(directional_list)]
-inverse_df['tx_weighted_fx'] = inverse_df['s_amount_s_fx'] / inverse_df['client_fx_rate']
-
-#Daily transaction volumes for each inverse pair
-daily_inverse_trans = (
-    inverse_df
-    .groupby(["processed_date", "s_fx", "r_fx"], as_index=False)
-    .agg({"s_amount_s_fx": "sum"})
-)
-#Total transaction volumes for each inverse pair
-total_inverse_trans = (
-    inverse_df
-    .groupby(["s_fx", "r_fx"], as_index=False)
-    .agg({"s_amount_s_fx": "sum"})
+# Total transaction weighted FX
+total_trx_fx = (
+    df[pair_cols]
+    .sum(min_count=1)
 )
 
-# %% merging the data sets
-combined_df = pd.concat([standard_df, inverse_df], ignore_index=True)
-
-daily_volume = (
-    combined_df
-    .groupby(["processed_date", "s_fx", "r_fx"], as_index=False)
-    .agg({"tx_weighted_fx": "sum"})
+# Converting daily FX to long format
+daily_trx_fx = daily_trx_fx.melt(
+    id_vars="processed_date",
+    var_name="standard_pair",
+    value_name="trx_fx"
 )
 
-combined_df['currency_pair'] = combined_df.apply(lambda x: frozenset([x['s_fx'], x['r_fx']]), axis=1)
-
-daily_corridor_sum = (
-    combined_df
-    .groupby(['processed_date', 'currency_pair'], as_index=False)
-    .agg({'tx_weighted_fx': 'sum'})
+# %% Calculating Total and Daily Transaction Volume (by sent USD amount)
+daily_trx_vol = (
+    df
+    .groupby(["processed_date", "standard_pair"], as_index=False)
+    .agg({"s_amount_usd": "sum"})
 )
 
-daily_corridor_sum['currency_pair'] = daily_corridor_sum['currency_pair'].apply(
-    lambda x: next((p for p in directional_list if set(p) == set(x)), x)
+total_trx_vol = (
+    df
+    .groupby(["standard_pair"], as_index=False)
+    .agg({"s_amount_usd": "sum"})
 )
 
-daily_corridor_sum['processed_date'] = pd.to_datetime(daily_corridor_sum['processed_date']).dt.date
-# %% Combining the standard and inverse transaction-weighted FX rates
-
-# Standard trades
-daily_trans['currency_pair'] = daily_trans.apply(
-    lambda x: tuple([x['s_fx'], x['r_fx']]), axis=1
-)
-
-# Inverse trades
-daily_inverse_trans['currency_pair'] = daily_inverse_trans.apply(
-    lambda x: tuple([x['s_fx'], x['r_fx']]), axis=1
-)
-
-# Standard trades
-daily_standard_sum = (
-    daily_trans
-    .groupby(['processed_date', 'currency_pair'], as_index=False)
-    .agg({'s_amount_s_fx': 'sum'})
-)
-
-# Inverse trades
-daily_inverse_sum = (
-    daily_inverse_trans
-    .groupby(['processed_date', 'currency_pair'], as_index=False)
-    .agg({'s_amount_s_fx': 'sum'})
-)
-
-# %% Treat bi-directional trade as the same
-combined_daily = pd.concat([daily_standard_sum, daily_inverse_sum], ignore_index=True)
-
-combined_daily['currency_pair'] = combined_daily['currency_pair'].apply(
-    lambda x: next((p for p in directional_list if set(p) == set(x)), x)
-)
-
-total_daily_pair = (
-    combined_daily
-    .groupby(['processed_date', 'currency_pair'], as_index=False)
-    .agg({'s_amount_s_fx': 'sum'})
-)
-total_daily_pair['processed_date'] = pd.to_datetime(total_daily_pair['processed_date']).dt.date
-
-# %% Calculating Daily Weighted FX Rate
+# %% Calculating daily weighted-average FX rate
 daily_weighted_fx = pd.merge(
-    total_daily_pair,
-    daily_corridor_sum,
-    on=['processed_date', 'currency_pair'],
-    how='left',  # keeps all rows from total_daily_pair
+    daily_trx_fx,
+    daily_trx_vol,
+    on=['processed_date', 'standard_pair'],
+    how='left',
 )
 
-daily_weighted_fx['weighted_rate'] = daily_weighted_fx['tx_weighted_fx'] / daily_weighted_fx['s_amount_s_fx']
+daily_weighted_fx['weighted_rate'] = daily_weighted_fx['trx_fx'] / daily_weighted_fx['s_amount_usd']
 
-# %% Whole Period Weighted FX
-total_corridor_sum = (
-    daily_corridor_sum
-    .groupby(['currency_pair'], as_index=False)
-    .agg({'tx_weighted_fxt': 'sum'})
-)
+# %% Calculating total weighted-average FX rate
+# Convert total transaction FX to DataFrame
+total_trx_fx = total_trx_fx.reset_index()
+total_trx_fx.columns = ["standard_pair", "trx_fx"]  # rename columns
 
-total_pair = (
-    total_daily_pair
-    .groupby(['currency_pair'], as_index=False)
-    .agg({'s_amount_s_fx': 'sum'})
-)
-
+# Merge with total_trx_vol to get total USD per pair
 total_weighted_fx = pd.merge(
-    total_pair,
-    total_corridor_sum,
-    on=['currency_pair'],
-    how='left',  # keeps all rows from total_daily_pair
+    total_trx_fx,
+    total_trx_vol,
+    on="standard_pair",
+    how="left"
 )
 
-total_weighted_fx['weighted_rate'] = total_weighted_fx['tx_weighted_fx'] / total_weighted_fx['s_amount_s_fx']
-
-# %% Print Daily FX Rate
-daily_weighted_fx
-daily_weighted_fx.to_csv("output/daily_weighted_fx.csv")
-
-# %% Print Total FX Rate
-total_weighted_fx
-total_weighted_fx.to_csv("output/period_weighted_fx.csv")
+# Calculate weighted FX
+total_weighted_fx["weighted_rate"] = total_weighted_fx["trx_fx"] / total_weighted_fx["s_amount_usd"]
