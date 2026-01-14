@@ -40,7 +40,7 @@ df = df[cols]
 # Filter for successful transactions only
 # And ignores non cross-border transactions
 df = df[df['status'] == 'Success']
-df = df[df["s_fx"] != df["r_fx"]]
+# df = df[df["s_fx"] != df["r_fx"]]
 
 # %% Keeping only relevant transactions
 bases = {pair[0] for pair in currency_pairs}
@@ -51,6 +51,11 @@ df = df[
     df["s_fx"].isin(quotes) |
     df["r_fx"].isin(quotes)
 ]
+
+# Map base currencies to all their quotes
+base_to_quote = defaultdict(set)
+for base, quote in currency_pairs:
+    base_to_quote[base].add(quote)
 
 # %% Keeping only relevant columns
 keep_column = [
@@ -69,14 +74,6 @@ keep_column = [
     "r_amount_usd"
 ]
 df = df[keep_column]
-
-
-# %%
-# Map base currencies to all their quotes
-base_to_quote = defaultdict(set)
-
-for base, quote in currency_pairs:
-    base_to_quote[base].add(quote)
 
 #%% Calculate the relevant FX rate for each transaction
 def classify_row(row):
@@ -116,7 +113,7 @@ df[["standardised_rate", "standard_pair"]] = df.apply(
     axis=1
 )
 
-# Drop rows that were ignored (None returned)
+# Drop rows that were ignored
 df = df.dropna(subset=["standardised_rate"]).copy()
 
 # %% Calculating transaction weighted FX rate for each transaction
