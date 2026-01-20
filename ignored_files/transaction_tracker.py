@@ -3,8 +3,6 @@ import pandas as pd
 import os
 import numpy as np
 from collections import defaultdict
-from sqlalchemy import create_engine
-from urllib.parse import quote_plus
 
 # %% User Input Area
 currency_pairs = [
@@ -14,31 +12,35 @@ currency_pairs = [
 ]
 
 start_date = "2026-01-01"
-end_date = "2026-01-18"
+end_date = "2026-01-07"
 
-# %% Import from SQL
-password = quote_plus("zqL4HmvHY8Mi&bap")
-engine = create_engine(
-    f"mysql+mysqlconnector://matthew.shao:{password}@mfsa-reversal-master-rds-prod.cvzkhfo7oqvr.us-east-1.rds.amazonaws.com:3306/onafriq_forex_adapter"
-)
+# %% Set path to data
+script_folder = os.path.dirname(os.path.abspath(__file__))
+path = script_folder + "\\data"
+dates = pd.date_range(start=start_date, end=end_date)
+dfs = []
 
-df = pd.read_sql(
-    f"""
-    SELECT *
-    FROM transaction_details
-    WHERE transaction_processed_date BETWEEN '{start_date}' AND '{end_date}'
-    ORDER BY transaction_processed_date ASC
-    """,
-    engine
-)
+# %% Import and Clean Data
+for d in dates:
+    date_str = d.strftime("%Y-%m-%d")
+    file_path = f"{path}/DSR_ONAFRIQ_{date_str}.csv" 
+    df_daily = pd.read_csv(file_path)
+    dfs.append(df_daily)
 
-# %% Import FX blotter
-blotter_path = "C:\\Users\\MatthewShao\\OneDrive - Onafriq Limited\\Documents\\Dynamic FX Pricing Engine\\data\\fx_blotter_master_2025_v2.xlsx"
-fx_blotter = pd.read_excel(blotter_path, sheet_name="curbi_fxrates")
+# Stack them on top of each other
+df = pd.concat(dfs, ignore_index=True)
 
 # %% Add column for just date
-df['transaction_processed_date'] = pd.to_datetime(df['transaction_processed_date'], errors='coerce')
-df['processed_date'] = df['transaction_processed_date'].dt.date
+df['dateprocessed'] = pd.to_datetime(df['dateprocessed'], errors='coerce')
+df['processed_date'] = df['dateprocessed'].dt.date
+cols = list(df.columns)
+cols.insert(2, cols.pop(cols.index('processed_date')))
+df = df[cols]  
+
+# Filter for successful transactions only
+# And ignores non cross-border transactions
+df = df[df['status'] == 'Success']
+# df = df[df["s_fx"] != df["r_fx"]]
 
 # %% Keeping only relevant transactions
 bases = {pair[0] for pair in currency_pairs}
@@ -46,11 +48,9 @@ quotes = {pair[1] for pair in currency_pairs}
 all_pair_currencies = bases | quotes
 
 df = df[
-    df["send_currency"].isin(quotes) |
-    df["receive_currency"].isin(quotes)
+    df["s_fx"].isin(quotes) |
+    df["r_fx"].isin(quotes)
 ]
-
-df = df[df['send_currency'] != df['receive_currency']]
 
 # Map base currencies to all their quotes
 base_to_quote = defaultdict(set)
@@ -59,99 +59,66 @@ for base, quote in currency_pairs:
 
 # %% Keeping only relevant columns
 keep_column = [
-    "transaction_processed_date",
+    "datecreated",
+    "dateprocessed",
     "processed_date",
-    "send_amount",
-    "receive_amount",
-    "send_currency",
-    "receive_currency",
-    "rate"
+    "status",
+    "s_fx",
+    "s_amount_s_fx",
+    "r_fx",
+    "r_amount_r_fx",
+    "client_fx_rate",
+    "s_fx_to_usd",
+    "r_fx_to_usd",
+    "s_amount_usd",
+    "r_amount_usd"
 ]
 df = df[keep_column]
 
-# %% Adding on US rate
-fx_usd = fx_blotter[['date', 'tocurrency', 'mid']].copy()
-df['processed_date'] = pd.to_datetime(df['processed_date'])
-fx_usd['date'] = pd.to_datetime(fx_usd['date'])
-
-# adding usd rates to send currencies
-fx_usd.rename(columns={
-    'date': 'processed_date',
-    'tocurrency': 'currency',
-    'mid': 'fx_rate'
-}, inplace=True)
-
-# Merge send_currency
-df = df.merge(
-    fx_usd[['processed_date', 'currency', 'fx_rate']],
-    how='left',
-    left_on=['processed_date', 'send_currency'],
-    right_on=['processed_date', 'currency']
-)
-df.rename(columns={'fx_rate': 's_fx_to_usd'}, inplace=True)
-df.drop(columns=['currency'], inplace=True)
-
-# Merge receive_currency
-df = df.merge(
-    fx_usd[['processed_date', 'currency', 'fx_rate']],
-    how='left',
-    left_on=['processed_date', 'receive_currency'],
-    right_on=['processed_date', 'currency']
-)
-df.rename(columns={'fx_rate': 'r_fx_to_usd'}, inplace=True)
-df.drop(columns=['currency'], inplace=True)
-
-df['s_fx_to_usd'] = df['s_fx_to_usd'].fillna(1)
-df['r_fx_to_usd'] = df['r_fx_to_usd'].fillna(1)
-
-# %% Calculate the relevant FX rate for each transaction
+#%% Calculate the relevant FX rate for each transaction
 def classify_row(row):
-    s, r = row["send_currency"], row["receive_currency"]
-
-    # Ignore same-currency transactions
+    s, r = row["s_fx"], row["r_fx"]
+    # ignore same-currency
     if s == r:
         return None, None 
 
     # Case 1: s_fx is base, r_fx is quote
     if s in base_to_quote and r in base_to_quote[s]:
-        rate = row["rate"]  # use the original client rate
+        rate = row["client_fx_rate"]
         pair = f"{s}{r}"
-
+        
     # Case 2: s_fx is quote, r_fx is base
     elif r in base_to_quote and s in base_to_quote[r]:
-        rate = 1 / row["rate"]
+        rate = 1 / row["client_fx_rate"]
         pair = f"{r}{s}"
-
+        
     # Case 3: s_fx is non-pair, r_fx is quote
     elif r in quotes:
-        rate = row["rate"] * row["s_fx_to_usd"]
+        rate = row["client_fx_rate"] * row["s_fx_to_usd"]
         pair = f"USD{r}"
-
+        
     # Case 4: s_fx is quote, r_fx is non-pair
     elif s in quotes:
-        rate = (1 / row["rate"]) * row["r_fx_to_usd"]
+        rate = (1 / row["client_fx_rate"]) * row["r_fx_to_usd"]
         pair = f"USD{s}"
-
-    # Ignore anything that doesn't fit
+    
+    # ignore anything that doesn't fit
     else:
         return None, None 
 
     return rate, pair
 
-# Apply row-by-row
 df[["standardised_rate", "standard_pair"]] = df.apply(
     lambda row: pd.Series(classify_row(row)),
     axis=1
 )
 
-# Drop rows that were ignored (None rates)
+# Drop rows that were ignored
 df = df.dropna(subset=["standardised_rate"]).copy()
 
 # %% Calculating transaction weighted FX rate for each transaction
 pair_cols = df["standard_pair"].dropna().unique().tolist()
 pair_data = pd.DataFrame(np.nan, index=df.index, columns=pair_cols)
-df["s_amount_usd"] = df["send_amount"] * df["s_fx_to_usd"]
-
 
 for col in pair_cols:
     mask = df["standard_pair"] == col
@@ -219,5 +186,3 @@ total_weighted_fx = pd.merge(
 
 # Calculate weighted FX
 total_weighted_fx["weighted_rate"] = total_weighted_fx["trx_fx"] / total_weighted_fx["s_amount_usd"]
-
-# %%
