@@ -33,7 +33,8 @@ df = pd.read_sql(
 )
 
 # %% Import FX blotter
-blotter_path = "C:\\Users\\MatthewShao\\OneDrive - Onafriq Limited\\Documents\\Dynamic FX Pricing Engine\\data\\fx_blotter_master_2025_v2.xlsx"
+script_folder = os.path.dirname(os.path.abspath(__file__))
+blotter_path = script_folder + "\\data\\fx_blotter_master_2025_v2.xlsx"
 fx_blotter = pd.read_excel(blotter_path, sheet_name="curbi_fxrates")
 
 # %% Add column for just date
@@ -152,7 +153,6 @@ pair_cols = df["standard_pair"].dropna().unique().tolist()
 pair_data = pd.DataFrame(np.nan, index=df.index, columns=pair_cols)
 df["s_amount_usd"] = df["send_amount"] * df["s_fx_to_usd"]
 
-
 for col in pair_cols:
     mask = df["standard_pair"] == col
     pair_data.loc[mask, col] = df.loc[mask, "standardised_rate"] * df.loc[mask, "s_amount_usd"]
@@ -203,6 +203,7 @@ daily_weighted_fx = pd.merge(
 )
 
 daily_weighted_fx['weighted_rate'] = daily_weighted_fx['trx_fx'] / daily_weighted_fx['s_amount_usd']
+daily_weighted_fx.to_csv("output/daily_weighted_fx.csv")
 
 # %% Calculating total weighted-average FX rate
 # Convert total transaction FX to DataFrame
@@ -219,5 +220,4 @@ total_weighted_fx = pd.merge(
 
 # Calculate weighted FX
 total_weighted_fx["weighted_rate"] = total_weighted_fx["trx_fx"] / total_weighted_fx["s_amount_usd"]
-
-# %%
+total_weighted_fx.to_csv("output/total_weighted_fx.csv")
